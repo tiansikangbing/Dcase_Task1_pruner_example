@@ -1,12 +1,22 @@
 import argparse
 import numpy as np
+import random
 import torch
+from torch.autograd import Variable
 import torch.nn.functional as F
 import torchaudio
 from torch.utils.data import DataLoader
 from dataset.data import get_training_set, get_test_set
 from torch.distributions.beta import Beta
-from models.module import get_model
+from models.DCASEBaselineCnn3 import get_model_DCASEBaselineCnn3
+from models.TFSepNet import get_model_TFSepNet
+from Tools.complexity import get_model_size_bytes
+from transformers import get_cosine_schedule_with_warmup
+import torch_pruning as tp
+
+import sys
+sys.setrecursionlimit(5000)  # 或更大，根据需要调整
+
 
 # 参数预输入
 def get_args():
@@ -21,18 +31,21 @@ def get_args():
     parser.add_argument("--f_max", type=int, default=None)
     parser.add_argument("--freqm", type=int, default=48)
     parser.add_argument("--timem", type=int, default=0)
+    parser.add_argument("--mixup_lam", type=float, default=1)
+    parser.add_argument("--mixup_alpha", type=float, default=0.3)
     parser.add_argument("--n_classes", type=int, default=10)
     parser.add_argument("--in_channels", type=int, default=1)
-    parser.add_argument("--base_channels", type=int, default=32)
-    parser.add_argument("--channels_multiplier", type=float, default=1.8)
+    parser.add_argument("--base_channels", type=int, default=64)
+    parser.add_argument("--channels_multiplier", type=float, default=1.5)
     parser.add_argument("--expansion_rate", type=float, default=2.1)
-    parser.add_argument("--n_epochs", type=int, default=150)
+    parser.add_argument("--n_epochs", type=int, default=100)
     parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--mixstyle_p", type=float, default=0.4)
     parser.add_argument("--mixstyle_alpha", type=float, default=0.3)
     parser.add_argument("--weight_decay", type=float, default=0.0001)
     parser.add_argument("--roll_sec", type=float, default=0.1)
     parser.add_argument("--lr", type=float, default=0.005)
+    parser.add_argument("--warmup_steps", type=int, default=2000)
     parser.add_argument("--num_workers", type=int, default=4)
     return parser.parse_args()
 
@@ -69,7 +82,15 @@ def mel_forward(mel, mel_augment, x, training):
     x = (x + 1e-5).log()
     return x
 
-import random
+# mixup 数据增强
+def mix_up(lam, alpha, x, y):
+    lam = np.random.beta(alpha, alpha)
+    batch_size = x.size()[0]
+    index = torch.randperm(batch_size).to(x.device)
+    x = lam * x + (1 - lam) * x[index, :]
+    y_a, y_b = y, y[index]
+    x, y_a, y_b = map(Variable, (x, y_a, y_b))
+    return x, (y_a, y_b)
 
 def worker_init_fn(wid):
     """
@@ -109,7 +130,7 @@ def mixstyle(x, p=0.4, alpha=0.3, eps=1e-6):
     return x
 
 # 训练一个epoch
-def train_one_epoch(model, train_batch, args, optimizer, mel, mel_augment, device):
+def train_one_epoch(model, train_batch, args, optimizer, scheduler, mel, mel_augment, device):
     model.train()
     for x, labels in train_batch:
         x, labels = x.to(device), labels.to(device)
@@ -117,11 +138,13 @@ def train_one_epoch(model, train_batch, args, optimizer, mel, mel_augment, devic
         if args.mixstyle_p > 0:
             # frequency mixstyle
             x = mixstyle(x, args.mixstyle_p, args.mixstyle_alpha)
+        x, y = mix_up(args.mixup_lam, args.mixup_alpha, x, labels)
         y_hat = model(x)
         loss = F.cross_entropy(y_hat, labels)
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
+        scheduler.step()
     return loss
 
 # 检验正确率
@@ -139,6 +162,68 @@ def eval_acc(model, test_batch, mel, device):
             total += labels.size(0)
     return correct / total
 
+# 剪枝
+import torch
+import torch_pruning as tp
+
+def prune_model(
+    model: torch.nn.Module,
+    example_inputs: torch.Tensor,
+    pruning_ratio: float = 0.2,
+    ignored_layers: list = None,
+    round_to: int = 8,
+    device: torch.device = None,
+):
+
+    if device is not None:
+        model.to(device)
+        example_inputs = example_inputs.to(device)
+
+    # 重要性评分，L2范数
+    imp = tp.importance.GroupMagnitudeImportance(p=2)
+
+    # 如果没有指定忽略层，自动忽略最后的分类层
+    if ignored_layers is None:
+        ignored_layers = []
+        for m in model.modules():
+            if isinstance(m, torch.nn.Linear):
+                ignored_layers.append(m)
+
+    pruner = tp.pruner.BasePruner(
+        model,
+        example_inputs,
+        importance=imp,
+        pruning_ratio=pruning_ratio,
+        ignored_layers=ignored_layers,
+        round_to=round_to,
+    )
+
+    base_macs, base_nparams = tp.utils.count_ops_and_params(model, example_inputs)
+    print("Before pruning:")
+    tp.utils.print_tool.before_pruning(model)
+
+    # 前向传播测试
+    model.eval()
+    example_inputs = example_inputs.to(device)
+    model.to(device)
+
+    try:
+        with torch.no_grad():
+            output = model(example_inputs)
+        print("Forward pass success, output shape:", output.shape)
+    except Exception as e:
+        print("Forward pass failed:", e)
+
+    pruner.step()
+
+    print("After pruning:")
+    tp.utils.print_tool.after_pruning(model)
+    macs, nparams = tp.utils.count_ops_and_params(model, example_inputs)
+    print(f"MACs: {base_macs/1e9:.4f} G -> {macs/1e9:.4f} G")
+    print(f"#Params: {base_nparams/1e6:.4f} M -> {nparams/1e6:.4f} M")
+
+    return model
+
 # 主函数
 def main():
     args = get_args()
@@ -154,27 +239,69 @@ def main():
     test_dl = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, worker_init_fn=worker_init_fn)
 
     # 模型
-    model = get_model(
-        n_classes=args.n_classes,
-        in_channels=args.in_channels,
-        base_channels=args.base_channels,
-        channels_multiplier=args.channels_multiplier,
-        expansion_rate=args.expansion_rate
-    ).to(device)
+    # model = get_model_DCASEBaselineCnn3(
+    #     n_classes=args.n_classes,
+    #     in_channels=args.in_channels,
+    #     base_channels=args.base_channels,
+    #     channels_multiplier=args.channels_multiplier,
+    #     expansion_rate=args.expansion_rate
+    # ).to(device)
 
+    model = get_model_TFSepNet(
+        in_channels = 1, 
+        num_classes = 10,
+        base_channels = 64,
+        depth = 17,
+        kernel_size = 3,
+        dropout = 0.1
+    ).to(device)         
+
+    # 计算模型参数大小
+    param_bytes = get_model_size_bytes(model)
+    print(f"模型参数总字节数: {param_bytes}，约为 {param_bytes / 1024:.2f} KB")
+    
     # 优化器
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    
+    # 学习率调度
+    total_steps = args.n_epochs * len(train_dl)
+    scheduler = get_cosine_schedule_with_warmup(
+    optimizer,
+    num_warmup_steps=args.warmup_steps,
+    num_training_steps=total_steps
+    )
 
     # 训练
     for epoch in range(1, args.n_epochs + 1):
-        train_loss = train_one_epoch(model=model, train_batch=train_dl, args=args, optimizer=optimizer, mel=mel, mel_augment=mel_augment, device=device)
+        train_loss = train_one_epoch(model=model, train_batch=train_dl, args=args, optimizer=optimizer, scheduler=scheduler, mel=mel, mel_augment=mel_augment, device=device)
         train_acc = eval_acc(model, train_dl, mel, device)
         val_acc = eval_acc(model, test_dl, mel, device)
-        print(f"Epoch {epoch:03d} | Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f} | Val Acc: {val_acc:.4f}")
+        print(f"Epoch {epoch:03d} | Learning Rate: {optimizer.param_groups[0]['lr']:.6f} | Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f} | Val Acc: {val_acc:.4f}")
         # 如果训练和验证准确率都达到50%，提前停止训练
-        if train_acc >= 0.5 and val_acc >= 0.5:
+        if train_acc >= 0.5 and val_acc >= 0.4:
             print(f"训练和验证准确率均达到50%，提前停止训练 (epoch={epoch})")
             break
+    
+    # # 剪枝
+    # print("开始模型剪枝")
+    # # 构造一个示例输入，形状根据模型输入调整
+    # example_input = torch.randn(1, args.in_channels, args.n_mels, 65).to(device)
+
+    # # 忽略最后的分类层
+    # ignored_layers = []
+    # for m in model.modules():
+    #     if isinstance(m, torch.nn.Conv2d):
+    #         if m.out_channels == 10:
+    #             ignored_layers.append(m)
+
+    # # 调用剪枝
+    # pruned_model = prune_model(
+    #     model,
+    #     example_inputs = example_input,
+    #     ignored_layers = ignored_layers,
+    #     device='cpu'
+    # )
+    # print(f"剪枝完成模型参数总字节数: {get_model_size_bytes(pruned_model)}，约为 {get_model_size_bytes(pruned_model) / 1024:.2f} KB")
 
     # 最终测试
     test_acc = eval_acc(model, test_dl, mel, device)

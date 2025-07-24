@@ -52,7 +52,7 @@ print(f"对数梅尔谱形状: {log_mel_spec.shape}")
 
 # 可视化梅尔频谱
 import matplotlib.pyplot as plt
-plt.imshow(log_mel_spec.squeeze().numpy(), aspect='auto', origin='lower')
+plt.imshow(mel_spec_aug.squeeze().numpy(), aspect='auto', origin='lower')
 plt.title('Log-Mel Spectrogram')
 plt.xlabel('Frame')
 plt.ylabel('Mel Bin')

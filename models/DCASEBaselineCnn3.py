@@ -240,8 +240,8 @@ class Network(nn.Module):
         return logits
 
 
-def get_model(n_classes=10, in_channels=1, base_channels=32, channels_multiplier=2.3, expansion_rate=3.0,
-              n_blocks=(3, 2, 1), strides=None):
+def get_model_DCASEBaselineCnn3(n_classes=10, in_channels=1, base_channels=32, channels_multiplier=2.3, expansion_rate=3.0,
+              n_blocks=(2, 2, 2, 3), strides=None):
     """
     @param n_classes: number of the classes to predict
     @param in_channels: input channels to the network, for audio it is by default 1
