@@ -6,16 +6,12 @@ from torch.autograd import Variable
 import torch.nn.functional as F
 import torchaudio
 from torch.utils.data import DataLoader
-from dataset.data import get_training_set, get_test_set
+from dataset.data import get_training_set, get_test_set, get_validation_set
 from torch.distributions.beta import Beta
 from models.DCASEBaselineCnn3 import get_model_DCASEBaselineCnn3
 from models.TFSepNet import get_model_TFSepNet
 from Tools.complexity import get_model_size_bytes
 from transformers import get_cosine_schedule_with_warmup
-import torch_pruning as tp
-
-import sys
-sys.setrecursionlimit(5000)  # 或更大，根据需要调整
 
 
 # 参数预输入
@@ -47,6 +43,8 @@ def get_args():
     parser.add_argument("--lr", type=float, default=0.005)
     parser.add_argument("--warmup_steps", type=int, default=2000)
     parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument('--bn_l1_lambda', type=float, default=1e-4, help='BN层L1正则化系数')
+    parser.add_argument("--retrain_epochs", type=int, default=50, help="重训练轮数")
     return parser.parse_args()
 
 # 定义音频预处理模型
@@ -131,6 +129,9 @@ def mixstyle(x, p=0.4, alpha=0.3, eps=1e-6):
 
 # 训练一个epoch
 def train_one_epoch(model, train_batch, args, optimizer, scheduler, mel, mel_augment, device):
+    l1_lambda = getattr(args, 'bn_l1_lambda', 1e-4)  # 可通过args设置L1系数
+    # 重训练时使用
+    l1_lambda = 0
     model.train()
     for x, labels in train_batch:
         x, labels = x.to(device), labels.to(device)
@@ -140,7 +141,14 @@ def train_one_epoch(model, train_batch, args, optimizer, scheduler, mel, mel_aug
             x = mixstyle(x, args.mixstyle_p, args.mixstyle_alpha)
         x, y = mix_up(args.mixup_lam, args.mixup_alpha, x, labels)
         y_hat = model(x)
-        loss = F.cross_entropy(y_hat, labels)
+        loss = args.mixup_lam * F.cross_entropy(y_hat, y[0]) + (1 - args.mixup_lam) * F.cross_entropy(y_hat, y[1])
+        # 对BN层权重施加L1正则化
+        l1_norm = 0.0
+        for m in model.modules():
+            if isinstance(m, torch.nn.BatchNorm2d) or isinstance(m, torch.nn.BatchNorm1d):
+                if m.weight is not None:
+                    l1_norm = l1_norm + torch.norm(m.weight, 1)
+        loss = loss + l1_lambda * l1_norm
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
@@ -162,68 +170,6 @@ def eval_acc(model, test_batch, mel, device):
             total += labels.size(0)
     return correct / total
 
-# 剪枝
-import torch
-import torch_pruning as tp
-
-def prune_model(
-    model: torch.nn.Module,
-    example_inputs: torch.Tensor,
-    pruning_ratio: float = 0.2,
-    ignored_layers: list = None,
-    round_to: int = 8,
-    device: torch.device = None,
-):
-
-    if device is not None:
-        model.to(device)
-        example_inputs = example_inputs.to(device)
-
-    # 重要性评分，L2范数
-    imp = tp.importance.GroupMagnitudeImportance(p=2)
-
-    # 如果没有指定忽略层，自动忽略最后的分类层
-    if ignored_layers is None:
-        ignored_layers = []
-        for m in model.modules():
-            if isinstance(m, torch.nn.Linear):
-                ignored_layers.append(m)
-
-    pruner = tp.pruner.BasePruner(
-        model,
-        example_inputs,
-        importance=imp,
-        pruning_ratio=pruning_ratio,
-        ignored_layers=ignored_layers,
-        round_to=round_to,
-    )
-
-    base_macs, base_nparams = tp.utils.count_ops_and_params(model, example_inputs)
-    print("Before pruning:")
-    tp.utils.print_tool.before_pruning(model)
-
-    # 前向传播测试
-    model.eval()
-    example_inputs = example_inputs.to(device)
-    model.to(device)
-
-    try:
-        with torch.no_grad():
-            output = model(example_inputs)
-        print("Forward pass success, output shape:", output.shape)
-    except Exception as e:
-        print("Forward pass failed:", e)
-
-    pruner.step()
-
-    print("After pruning:")
-    tp.utils.print_tool.after_pruning(model)
-    macs, nparams = tp.utils.count_ops_and_params(model, example_inputs)
-    print(f"MACs: {base_macs/1e9:.4f} G -> {macs/1e9:.4f} G")
-    print(f"#Params: {base_nparams/1e6:.4f} M -> {nparams/1e6:.4f} M")
-
-    return model
-
 # 主函数
 def main():
     args = get_args()
@@ -234,9 +180,12 @@ def main():
     # 数据集
     roll_samples = int(args.orig_sample_rate * args.roll_sec)
     train_ds = get_training_set(device=None, roll=roll_samples)
-    test_ds = get_test_set(device=None)
+    # test_ds = get_test_set(device=None)
+    validation_ds = get_validation_set(device=None)
     train_dl = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, worker_init_fn=worker_init_fn)
-    test_dl = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, worker_init_fn=worker_init_fn)
+    # test_dl = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, worker_init_fn=worker_init_fn)
+    validation_dl = DataLoader(validation_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, worker_init_fn=worker_init_fn)
+    
 
     # 模型
     # model = get_model_DCASEBaselineCnn3(
@@ -271,43 +220,38 @@ def main():
     num_training_steps=total_steps
     )
 
+    # 添加test_flag，前80轮，每十轮测试一次，后20轮每轮测试一次
+    test_flag = [1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+                 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+    best_val_acc = 0.0
+    best_model_state = None
     # 训练
     for epoch in range(1, args.n_epochs + 1):
         train_loss = train_one_epoch(model=model, train_batch=train_dl, args=args, optimizer=optimizer, scheduler=scheduler, mel=mel, mel_augment=mel_augment, device=device)
-        train_acc = eval_acc(model, train_dl, mel, device)
-        val_acc = eval_acc(model, test_dl, mel, device)
-        print(f"Epoch {epoch:03d} | Learning Rate: {optimizer.param_groups[0]['lr']:.6f} | Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f} | Val Acc: {val_acc:.4f}")
-        # 如果训练和验证准确率都达到50%，提前停止训练
-        if train_acc >= 0.5 and val_acc >= 0.4:
-            print(f"训练和验证准确率均达到50%，提前停止训练 (epoch={epoch})")
-            break
+        if test_flag[epoch - 1]:
+            train_acc = eval_acc(model, train_dl, mel, device)
+            val_acc = eval_acc(model, validation_dl, mel, device)
+            print(f"Epoch {epoch:03d} | Learning Rate: {optimizer.param_groups[0]['lr']:.6f} | Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f} | Val Acc: {val_acc:.4f}")
+            if val_acc > best_val_acc:
+                best_val_acc = val_acc
+                best_model_state = model.state_dict()
+        else:
+            print(f"Epoch {epoch:03d} | Learning Rate: {optimizer.param_groups[0]['lr']:.6f} | Train Loss: {train_loss:.4f} | Train Acc: N/A | Val Acc: N/A")
     
-    # # 剪枝
-    # print("开始模型剪枝")
-    # # 构造一个示例输入，形状根据模型输入调整
-    # example_input = torch.randn(1, args.in_channels, args.n_mels, 65).to(device)
+    # 保存测试正确率最高的模型参数
+    if best_model_state is not None:
+        torch.save(best_model_state, 'model_with_full_conv_without_shuffle.pth')
+        print(f'测试集最高准确率模型已保存到 model_best.pth，最高准确率为 {best_val_acc:.4f}')
 
-    # # 忽略最后的分类层
-    # ignored_layers = []
-    # for m in model.modules():
-    #     if isinstance(m, torch.nn.Conv2d):
-    #         if m.out_channels == 10:
-    #             ignored_layers.append(m)
-
-    # # 调用剪枝
-    # pruned_model = prune_model(
-    #     model,
-    #     example_inputs = example_input,
-    #     ignored_layers = ignored_layers,
-    #     device='cpu'
-    # )
-    # print(f"剪枝完成模型参数总字节数: {get_model_size_bytes(pruned_model)}，约为 {get_model_size_bytes(pruned_model) / 1024:.2f} KB")
-
-    # 最终测试
-    test_acc = eval_acc(model, test_dl, mel, device)
-    print(f"Final Test Accuracy: {test_acc:.4f}")
-
-    # 保存模型参数，便于后续剪枝/微调等
+    # 保存最终模型参数，便于分析
     torch.save(model.state_dict(), 'model.pth')
     print('模型参数已保存到 model.pth')
 

@@ -12,7 +12,8 @@ dataset_dir = "D:\local_repository\TAU-urban-acoustic-scenes-2022-mobile-develop
 dataset_config = {
     "dataset_name": "TAU2022",
     "split_path": "dataset\meta_dcase_2024\split5.csv",
-    "test_split_csv": "dataset\meta_dcase_2024\\test.csv"
+    "test_split_csv": "dataset\meta_dcase_2024\\test.csv",
+    "validation_split_csv": "dataset\meta_dcase_2024\\valid.csv"
 }
 
 class Dataset():
@@ -70,3 +71,8 @@ def get_training_set(device: Optional[str] = None, roll: int = 0) -> Dataset:
 def get_test_set(device: Optional[str] = None) -> Dataset:
     """Returns the test dataset."""
     return Dataset(dataset_config["test_split_csv"])
+
+# 返回验证集
+def get_validation_set(device: Optional[str] = None) -> Dataset:
+    """Returns the validation dataset."""
+    return Dataset(dataset_config["validation_split_csv"])
