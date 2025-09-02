@@ -6,7 +6,7 @@ from models.TFSepNet import ConvBnRelu
 from models.TFSepNet import ResNorm
 from models.TFSepNet import TimeFreqSepConvolutions
 from models.TFSepNet import ConvClassifier
-from main import eval_acc, train_one_epoch, get_args, build_mel_pipeline, worker_init_fn
+from train_cp_mobile import eval_acc, train_one_epoch, get_args, build_mel_pipeline, worker_init_fn
 from torch.utils.data import DataLoader
 from dataset.data import get_training_set
 from dataset.data import get_test_set
@@ -33,7 +33,7 @@ def main():
             kernel_size = 3,
             dropout = 0.1
         ).to(device)    
-    model.load_state_dict(torch.load('model.pth', map_location=device))
+    model.load_state_dict(torch.load('old_model.pth', map_location=device))
 
     # 剪枝前测试
     acc_before = eval_acc(model, test_dl, mel, device)
@@ -45,7 +45,7 @@ def main():
     print(f"模型参数量：{param_bytes / 4:.2f} ")
     # 剪枝
     prune_config = {
-        'prune_ratio': 0.3,
+        'prune_ratio': 0.5,
         'gamma_limit': 0.05,
         'prune_method': 'ratio'
     }

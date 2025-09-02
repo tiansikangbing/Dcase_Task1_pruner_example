@@ -8,10 +8,11 @@ import torchaudio
 from torch.utils.data import DataLoader
 from dataset.data import get_training_set, get_test_set, get_validation_set
 from torch.distributions.beta import Beta
-from models.DCASEBaselineCnn3 import get_model_DCASEBaselineCnn3
+from models.cp_mobile_clean import get_model_cp_mobile
 from models.TFSepNet import get_model_TFSepNet
 from Tools.complexity import get_model_size_bytes
 from transformers import get_cosine_schedule_with_warmup
+from models.mel import AugmentMelSTFT
 
 
 # 参数预输入
@@ -31,9 +32,9 @@ def get_args():
     parser.add_argument("--mixup_alpha", type=float, default=0.3)
     parser.add_argument("--n_classes", type=int, default=10)
     parser.add_argument("--in_channels", type=int, default=1)
-    parser.add_argument("--base_channels", type=int, default=64)
-    parser.add_argument("--channels_multiplier", type=float, default=1.5)
-    parser.add_argument("--expansion_rate", type=float, default=2.1)
+    parser.add_argument("--base_channels", type=int, default=32)
+    parser.add_argument("--channels_multiplier", type=float, default=2.3)
+    parser.add_argument("--expansion_rate", type=float, default=3)
     parser.add_argument("--n_epochs", type=int, default=100)
     parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--mixstyle_p", type=float, default=0.4)
@@ -44,10 +45,12 @@ def get_args():
     parser.add_argument("--warmup_steps", type=int, default=2000)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument('--bn_l1_lambda', type=float, default=1e-4, help='BN层L1正则化系数')
-    parser.add_argument("--retrain_epochs", type=int, default=50, help="重训练轮数")
+    parser.add_argument("--retrain_epochs", type=int, default=30, help="重训练轮数")
     return parser.parse_args()
+    parser.add_argument('--fmin_aug_range', type=int, default=1)
+    parser.add_argument('--fmax_aug_range', type=int, default=1000)
 
-# 定义音频预处理模型
+# 定义音频预处理模型 
 def build_mel_pipeline(args):
     mel = torch.nn.Sequential(
         torchaudio.transforms.Resample(orig_freq=args.orig_sample_rate, new_freq=args.sample_rate),
@@ -128,10 +131,11 @@ def mixstyle(x, p=0.4, alpha=0.3, eps=1e-6):
     return x
 
 # 训练一个epoch
-def train_one_epoch(model, train_batch, args, optimizer, scheduler, mel, mel_augment, device):
+def train_one_epoch(model, train_batch, args, optimizer, scheduler, mel, mel_augment, device, retrain = False):
     l1_lambda = getattr(args, 'bn_l1_lambda', 1e-4)  # 可通过args设置L1系数
     # 重训练时使用
-    l1_lambda = 0
+    if retrain:
+        l1_lambda = 0
     model.train()
     for x, labels in train_batch:
         x, labels = x.to(device), labels.to(device)
@@ -177,6 +181,18 @@ def main():
     mel, mel_augment = build_mel_pipeline(args)
     mel, mel_augment = mel.to(device), mel_augment.to(device)
 
+    # AugmentMelSTFT = AugmentMelSTFT(n_mels=args.n_mels,
+    #                                 sr=args.sample_rate,
+    #                                 win_length=args.window_length, 
+    #                                 hopsize=args.hop_length, 
+    #                                 n_fft=args.n_fft, 
+    #                                 freqm=args.freqm, 
+    #                                 timem=args.timem, 
+    #                                 fmin=args.f_min, 
+    #                                 fmax=args.f_max, 
+    #                                 fmin_aug_range = args.fmin_aug_range, fmax_aug_range = args.fmax_aug_range
+    #                                 )
+
     # 数据集
     roll_samples = int(args.orig_sample_rate * args.roll_sec)
     train_ds = get_training_set(device=None, roll=roll_samples)
@@ -196,18 +212,27 @@ def main():
     #     expansion_rate=args.expansion_rate
     # ).to(device)
 
-    model = get_model_TFSepNet(
-        in_channels = 1, 
-        num_classes = 10,
-        base_channels = 64,
-        depth = 17,
-        kernel_size = 3,
-        dropout = 0.1
-    ).to(device)         
+    # model = get_model_TFSepNet(
+    #     in_channels = 1, 
+    #     num_classes = 10,
+    #     base_channels = 64,
+    #     depth = 17,
+    #     kernel_size = 3,
+    #     dropout = 0.1
+    # ).to(device)     
 
+    model = get_model_cp_mobile(
+        n_classes=args.n_classes,
+        in_channels=args.in_channels,
+        base_channels=args.base_channels,
+        channels_multiplier=args.channels_multiplier,
+        expansion_rate=args.expansion_rate,
+        ).to(device)   
+
+    print(model)
     # 计算模型参数大小
-    param_bytes = get_model_size_bytes(model)
-    print(f"模型参数总字节数: {param_bytes}，约为 {param_bytes / 1024:.2f} KB")
+    param_bytes, num_params = get_model_size_bytes(model)
+    print(f"模型参数大小: {num_params}")
     
     # 优化器
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -230,6 +255,11 @@ def main():
                  1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
                  1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
                  1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+                 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
                  1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
     best_val_acc = 0.0
     best_model_state = None
@@ -248,8 +278,8 @@ def main():
     
     # 保存测试正确率最高的模型参数
     if best_model_state is not None:
-        torch.save(best_model_state, 'model_with_full_conv_without_shuffle.pth')
-        print(f'测试集最高准确率模型已保存到 model_best.pth，最高准确率为 {best_val_acc:.4f}')
+        torch.save(best_model_state, 'cp_mobile_L1_limit.pth')
+        print(f'测试集最高准确率模型已保存到 cp_mobile_L1_limit.pth，最高准确率为 {best_val_acc:.4f}')
 
     # 保存最终模型参数，便于分析
     torch.save(model.state_dict(), 'model.pth')

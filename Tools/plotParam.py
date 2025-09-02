@@ -1,3 +1,5 @@
+import torch
+import torch.nn as nn
 import matplotlib.pyplot as plt
 
 def plot_distribution(data, bins=30, title="data distribution", xlabel="value", ylabel="frequency"):
@@ -18,3 +20,14 @@ def plot_distribution(data, bins=30, title="data distribution", xlabel="value", 
     plt.ylabel(ylabel)
     plt.grid(True, linestyle='--', alpha=0.5)
     plt.show()
+
+def plot_bn_param(model):
+    # 打印模型结构
+    print(model)
+
+    # 遍历模型的每一层
+    for name, module in model.named_modules():
+        if isinstance(module, nn.BatchNorm2d):
+            print(module)
+            # 打印每个BatchNorm层的gamma参数
+            plot_distribution(module.weight.data.numpy(), bins=module.weight.data.numpy().shape[0], title=f'{name} gamma distribution', xlabel='gamma value', ylabel='frequency')   

@@ -43,6 +43,7 @@ def get_model_size_bytes(model: torch.nn.Module) -> int:
     }
 
     total_bytes = 0
+    total_nums = 0
     for param in model.parameters():
         dtype = param.dtype
         num_elements = param.numel()
@@ -50,7 +51,8 @@ def get_model_size_bytes(model: torch.nn.Module) -> int:
 
         if bytes_per_param is None:
             raise ValueError(f"Unsupported dtype: {dtype}. Please implement yourself.")
-
+        
+        total_nums += num_elements
         total_bytes += num_elements * bytes_per_param
-
-    return total_bytes
+ 
+    return total_bytes, total_nums
